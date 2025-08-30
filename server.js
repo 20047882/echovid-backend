@@ -6,18 +6,18 @@ const cors = require("cors");
 
 const app = express();
 
-// ✅ Allow localhost (dev) and any domain (prod). Adjust later if needed
+// ✅ Allow localhost (dev) and deployed frontend (Azure Static Web Apps)
 app.use(
   cors({
-    origin: ["http://localhost:3000", "*"],
+    origin: ["http://localhost:3000", "https://<YOUR-FRONTEND-APP-NAME>.azurestaticapps.net", "*"],
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
   })
 );
 
-// ✅ Increase request size limit (fix 413 error)
-app.use(express.json({ limit: "50mb" }));
-app.use(express.urlencoded({ limit: "50mb", extended: true }));
+// ✅ Increase request size (fix 413)
+app.use(express.json({ limit: "100mb" }));
+app.use(express.urlencoded({ limit: "100mb", extended: true }));
 
 // ENV VARIABLES
 const sqlConfig = {
@@ -46,12 +46,11 @@ async function getPool() {
 
 // ---------- ROUTES ---------- //
 
-// Signup (Consumers only)
+// Signup
 app.post("/signup", async (req, res) => {
   const { name, email, password } = req.body;
   try {
     const pool = await getPool();
-
     const result = await pool
       .request()
       .input("Email", sql.NVarChar, email.toLowerCase())
@@ -138,8 +137,13 @@ app.post("/upload", auth("Creator"), async (req, res) => {
     const blobServiceClient = BlobServiceClient.fromConnectionString(AZURE_STORAGE_CONNECTION);
     const containerClient = blobServiceClient.getContainerClient(CONTAINER_NAME);
     const blockBlobClient = containerClient.getBlockBlobClient(fileName);
+
     const buffer = Buffer.from(fileContent, "base64");
-    await blockBlobClient.uploadData(buffer);
+
+    // ✅ Ensure video plays (set content-type)
+    await blockBlobClient.uploadData(buffer, {
+      blobHTTPHeaders: { blobContentType: "video/mp4" },
+    });
 
     const blobUrl = blockBlobClient.url;
 
@@ -152,8 +156,8 @@ app.post("/upload", auth("Creator"), async (req, res) => {
       .input("AgeRating", sql.NVarChar, ageRating)
       .input("BlobURL", sql.NVarChar, blobUrl)
       .input("CreatorID", sql.Int, req.user.id)
-      .query(`INSERT INTO Videos (Title, Publisher, Producer, Genre, AgeRating, BlobURL, CreatorID)
-              VALUES (@Title, @Publisher, @Producer, @Genre, @AgeRating, @BlobURL, @CreatorID)`);
+      .query(`INSERT INTO Videos (Title, Publisher, Producer, Genre, AgeRating, BlobURL, CreatorID, UploadedAt)
+              VALUES (@Title, @Publisher, @Producer, @Genre, @AgeRating, @BlobURL, @CreatorID, GETDATE())`);
 
     res.json({ message: "Video uploaded successfully", url: blobUrl });
   } catch (err) {
@@ -183,10 +187,28 @@ app.post("/comment", auth(), async (req, res) => {
       .input("VideoID", sql.Int, videoId)
       .input("UserID", sql.Int, req.user.id)
       .input("CommentText", sql.NVarChar, comment)
-      .query("INSERT INTO Comments (VideoID, UserID, CommentText) VALUES (@VideoID, @UserID, @CommentText)");
+      .query("INSERT INTO Comments (VideoID, UserID, CommentText, CreatedAt) VALUES (@VideoID, @UserID, @CommentText, GETDATE())");
     res.json({ message: "Comment added" });
   } catch (err) {
     console.error("❌ Comment error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Get Comments
+app.get("/getComments/:videoId", async (req, res) => {
+  try {
+    const pool = await getPool();
+    const result = await pool.request()
+      .input("VideoID", sql.Int, req.params.videoId)
+      .query(`SELECT c.CommentText, u.Name, c.CreatedAt 
+              FROM Comments c 
+              JOIN Users u ON c.UserID = u.UserID 
+              WHERE c.VideoID=@VideoID 
+              ORDER BY c.CreatedAt DESC`);
+    res.json(result.recordset);
+  } catch (err) {
+    console.error("❌ Fetch comments error:", err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -200,7 +222,7 @@ app.post("/rate", auth(), async (req, res) => {
       .input("VideoID", sql.Int, videoId)
       .input("UserID", sql.Int, req.user.id)
       .input("Rating", sql.Int, rating)
-      .query("INSERT INTO Ratings (VideoID, UserID, Rating) VALUES (@VideoID, @UserID, @Rating)");
+      .query("INSERT INTO Ratings (VideoID, UserID, Rating, CreatedAt) VALUES (@VideoID, @UserID, @Rating, GETDATE())");
     res.json({ message: "Rating submitted" });
   } catch (err) {
     console.error("❌ Rating error:", err);
@@ -208,6 +230,20 @@ app.post("/rate", auth(), async (req, res) => {
   }
 });
 
-// Start server
+// Get Ratings
+app.get("/getRatings/:videoId", async (req, res) => {
+  try {
+    const pool = await getPool();
+    const result = await pool.request()
+      .input("VideoID", sql.Int, req.params.videoId)
+      .query("SELECT AVG(Rating) AS AvgRating, COUNT(*) AS TotalRatings FROM Ratings WHERE VideoID=@VideoID");
+    res.json(result.recordset[0]);
+  } catch (err) {
+    console.error("❌ Fetch ratings error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ---------- START SERVER ---------- //
 const port = process.env.PORT || 8080;
 app.listen(port, () => console.log(`EchoVid API running on port ${port}`));
