@@ -2,8 +2,19 @@ const express = require("express");
 const sql = require("mssql");
 const jwt = require("jsonwebtoken");
 const { BlobServiceClient } = require("@azure/storage-blob");
+const cors = require("cors"); // ✅ add cors
 
 const app = express();
+
+// ✅ Allow requests from your React frontend
+app.use(
+  cors({
+    origin: "http://localhost:3000", // React dev server
+    methods: ["GET", "POST", "PUT", "DELETE"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+  })
+);
+
 app.use(express.json());
 
 // ENV VARIABLES
@@ -14,8 +25,8 @@ const sqlConfig = {
   server: process.env.SQL_SERVER,
   options: {
     encrypt: true,
-    trustServerCertificate: false
-  }
+    trustServerCertificate: false,
+  },
 };
 
 const AZURE_STORAGE_CONNECTION = process.env.AZURE_STORAGE_CONNECTION;
@@ -38,12 +49,11 @@ app.post("/signup", async (req, res) => {
   const { name, email, password } = req.body;
   try {
     const pool = await getPool();
-
-    // enforce lowercase email to avoid case-sensitive mismatch
     const lowerEmail = email.toLowerCase();
 
     // check duplicate email
-    const existing = await pool.request()
+    const existing = await pool
+      .request()
       .input("Email", sql.NVarChar, lowerEmail)
       .query("SELECT * FROM Users WHERE LOWER(Email)=@Email");
 
@@ -51,12 +61,15 @@ app.post("/signup", async (req, res) => {
       return res.status(400).json({ error: "Email already registered" });
     }
 
-    await pool.request()
+    await pool
+      .request()
       .input("Name", sql.NVarChar, name)
       .input("Email", sql.NVarChar, lowerEmail)
       .input("PasswordHash", sql.NVarChar, password) // storing plain text
       .input("Role", sql.NVarChar, "Consumer")
-      .query("INSERT INTO Users (Name, Email, PasswordHash, Role) VALUES (@Name, @Email, @PasswordHash, @Role)");
+      .query(
+        "INSERT INTO Users (Name, Email, PasswordHash, Role) VALUES (@Name, @Email, @PasswordHash, @Role)"
+      );
 
     res.json({ message: "Consumer registered successfully" });
   } catch (err) {
@@ -71,20 +84,25 @@ app.post("/login", async (req, res) => {
     const pool = await getPool();
     const lowerEmail = email.toLowerCase();
 
-    const result = await pool.request()
+    const result = await pool
+      .request()
       .input("Email", sql.NVarChar, lowerEmail)
       .query("SELECT * FROM Users WHERE LOWER(Email)=@Email");
 
-    if (result.recordset.length === 0) return res.status(400).json({ error: "User not found" });
+    if (result.recordset.length === 0)
+      return res.status(400).json({ error: "User not found" });
 
     const user = result.recordset[0];
 
-    // plain text comparison
     if (password !== user.PasswordHash) {
       return res.status(400).json({ error: "Invalid password" });
     }
 
-    const token = jwt.sign({ id: user.UserID, role: user.Role }, JWT_SECRET, { expiresIn: "1h" });
+    const token = jwt.sign(
+      { id: user.UserID, role: user.Role },
+      JWT_SECRET,
+      { expiresIn: "1h" }
+    );
     res.json({ token, role: user.Role });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -114,7 +132,6 @@ function auth(requiredRole) {
 app.post("/upload", auth("Creator"), async (req, res) => {
   const { title, publisher, producer, genre, ageRating, fileName, fileContent } = req.body;
   try {
-    // Upload to Blob
     const blobServiceClient = BlobServiceClient.fromConnectionString(AZURE_STORAGE_CONNECTION);
     const containerClient = blobServiceClient.getContainerClient(CONTAINER_NAME);
     const blockBlobClient = containerClient.getBlockBlobClient(fileName);
@@ -123,7 +140,6 @@ app.post("/upload", auth("Creator"), async (req, res) => {
 
     const blobUrl = blockBlobClient.url;
 
-    // Save metadata in DB
     const pool = await getPool();
     await pool.request()
       .input("Title", sql.NVarChar, title)
