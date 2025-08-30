@@ -1,6 +1,5 @@
 const express = require("express");
 const sql = require("mssql");
-const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const { BlobServiceClient } = require("@azure/storage-blob");
 
@@ -34,38 +33,56 @@ async function getPool() {
 
 // ---------- ROUTES ---------- //
 
-// Signup (Consumers only)
+// Signup (Consumers only, plain password)
 app.post("/signup", async (req, res) => {
   const { name, email, password } = req.body;
   try {
     const pool = await getPool();
-    const hashed = await bcrypt.hash(password, 10);
+
+    // enforce lowercase email to avoid case-sensitive mismatch
+    const lowerEmail = email.toLowerCase();
+
+    // check duplicate email
+    const existing = await pool.request()
+      .input("Email", sql.NVarChar, lowerEmail)
+      .query("SELECT * FROM Users WHERE LOWER(Email)=@Email");
+
+    if (existing.recordset.length > 0) {
+      return res.status(400).json({ error: "Email already registered" });
+    }
+
     await pool.request()
       .input("Name", sql.NVarChar, name)
-      .input("Email", sql.NVarChar, email)
-      .input("PasswordHash", sql.NVarChar, hashed)
+      .input("Email", sql.NVarChar, lowerEmail)
+      .input("PasswordHash", sql.NVarChar, password) // storing plain text
       .input("Role", sql.NVarChar, "Consumer")
       .query("INSERT INTO Users (Name, Email, PasswordHash, Role) VALUES (@Name, @Email, @PasswordHash, @Role)");
+
     res.json({ message: "Consumer registered successfully" });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// Login (Consumers + Creators)
+// Login (Consumers + Creators, plain password)
 app.post("/login", async (req, res) => {
   const { email, password } = req.body;
   try {
     const pool = await getPool();
+    const lowerEmail = email.toLowerCase();
+
     const result = await pool.request()
-      .input("Email", sql.NVarChar, email)
-      .query("SELECT * FROM Users WHERE Email=@Email");
+      .input("Email", sql.NVarChar, lowerEmail)
+      .query("SELECT * FROM Users WHERE LOWER(Email)=@Email");
 
     if (result.recordset.length === 0) return res.status(400).json({ error: "User not found" });
 
     const user = result.recordset[0];
-    const valid = await bcrypt.compare(password, user.PasswordHash);
-    if (!valid) return res.status(400).json({ error: "Invalid password" });
+
+    // plain text comparison
+    if (password !== user.PasswordHash) {
+      return res.status(400).json({ error: "Invalid password" });
+    }
 
     const token = jwt.sign({ id: user.UserID, role: user.Role }, JWT_SECRET, { expiresIn: "1h" });
     res.json({ token, role: user.Role });
@@ -101,7 +118,7 @@ app.post("/upload", auth("Creator"), async (req, res) => {
     const blobServiceClient = BlobServiceClient.fromConnectionString(AZURE_STORAGE_CONNECTION);
     const containerClient = blobServiceClient.getContainerClient(CONTAINER_NAME);
     const blockBlobClient = containerClient.getBlockBlobClient(fileName);
-    const buffer = Buffer.from(fileContent, "base64"); // frontend sends base64
+    const buffer = Buffer.from(fileContent, "base64");
     await blockBlobClient.uploadData(buffer);
 
     const blobUrl = blockBlobClient.url;
