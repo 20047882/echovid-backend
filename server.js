@@ -2,15 +2,15 @@ const express = require("express");
 const sql = require("mssql");
 const jwt = require("jsonwebtoken");
 const { BlobServiceClient } = require("@azure/storage-blob");
-const cors = require("cors"); // ✅ add cors
+const cors = require("cors");
 
 const app = express();
 
-// ✅ Allow requests from your React frontend
+// ✅ Allow localhost (dev) and any domain (prod). Adjust later if needed
 app.use(
   cors({
-    origin: "http://localhost:3000", // React dev server
-    methods: ["GET", "POST", "PUT", "DELETE"],
+    origin: ["http://localhost:3000", "*"],
+    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
   })
 );
@@ -31,7 +31,7 @@ const sqlConfig = {
 
 const AZURE_STORAGE_CONNECTION = process.env.AZURE_STORAGE_CONNECTION;
 const CONTAINER_NAME = process.env.CONTAINER_NAME || "videos";
-const JWT_SECRET = "supersecretkey"; // change to stronger secret
+const JWT_SECRET = "supersecretkey";
 
 // SQL Connection Pool
 let pool;
@@ -44,72 +44,73 @@ async function getPool() {
 
 // ---------- ROUTES ---------- //
 
-// Signup (Consumers only, plain password)
+// Signup (Consumers only)
 app.post("/signup", async (req, res) => {
   const { name, email, password } = req.body;
   try {
     const pool = await getPool();
-    const lowerEmail = email.toLowerCase();
 
-    // check duplicate email
-    const existing = await pool
+    const result = await pool
       .request()
-      .input("Email", sql.NVarChar, lowerEmail)
-      .query("SELECT * FROM Users WHERE LOWER(Email)=@Email");
+      .input("Email", sql.NVarChar, email.toLowerCase())
+      .query(
+        "SELECT * FROM Users WHERE Email COLLATE Latin1_General_CI_AS = @Email"
+      );
 
-    if (existing.recordset.length > 0) {
+    if (result.recordset.length > 0) {
       return res.status(400).json({ error: "Email already registered" });
     }
 
     await pool
       .request()
       .input("Name", sql.NVarChar, name)
-      .input("Email", sql.NVarChar, lowerEmail)
-      .input("PasswordHash", sql.NVarChar, password) // storing plain text
+      .input("Email", sql.NVarChar, email.toLowerCase())
+      .input("PasswordHash", sql.NVarChar, password)
       .input("Role", sql.NVarChar, "Consumer")
       .query(
-        "INSERT INTO Users (Name, Email, PasswordHash, Role) VALUES (@Name, @Email, @PasswordHash, @Role)"
+        "INSERT INTO Users (Name, Email, PasswordHash, Role, CreatedAt) VALUES (@Name, @Email, @PasswordHash, @Role, GETDATE())"
       );
 
     res.json({ message: "Consumer registered successfully" });
   } catch (err) {
+    console.error("❌ Signup error:", err);
     res.status(500).json({ error: err.message });
   }
 });
 
-// Login (Consumers + Creators, plain password)
+// Login
 app.post("/login", async (req, res) => {
   const { email, password } = req.body;
   try {
     const pool = await getPool();
-    const lowerEmail = email.toLowerCase();
 
     const result = await pool
       .request()
-      .input("Email", sql.NVarChar, lowerEmail)
-      .query("SELECT * FROM Users WHERE LOWER(Email)=@Email");
+      .input("Email", sql.NVarChar, email.trim().toLowerCase())
+      .input("PasswordHash", sql.NVarChar, password.trim())
+      .query(
+        "SELECT * FROM Users WHERE Email COLLATE Latin1_General_CI_AS = @Email AND PasswordHash = @PasswordHash"
+      );
 
-    if (result.recordset.length === 0)
-      return res.status(400).json({ error: "User not found" });
-
-    const user = result.recordset[0];
-
-    if (password !== user.PasswordHash) {
-      return res.status(400).json({ error: "Invalid password" });
+    if (result.recordset.length === 0) {
+      return res.status(401).json({ error: "Invalid credentials" });
     }
 
+    const user = result.recordset[0];
     const token = jwt.sign(
       { id: user.UserID, role: user.Role },
       JWT_SECRET,
       { expiresIn: "1h" }
     );
+
     res.json({ token, role: user.Role });
   } catch (err) {
+    console.error("❌ Login error:", err);
     res.status(500).json({ error: err.message });
   }
 });
 
-// Middleware to protect routes
+// Middleware
 function auth(requiredRole) {
   return (req, res, next) => {
     const header = req.headers["authorization"];
@@ -128,7 +129,7 @@ function auth(requiredRole) {
   };
 }
 
-// Upload Video (Creators only)
+// Upload Video
 app.post("/upload", auth("Creator"), async (req, res) => {
   const { title, publisher, producer, genre, ageRating, fileName, fileContent } = req.body;
   try {
@@ -154,22 +155,24 @@ app.post("/upload", auth("Creator"), async (req, res) => {
 
     res.json({ message: "Video uploaded successfully", url: blobUrl });
   } catch (err) {
+    console.error("❌ Upload error:", err);
     res.status(500).json({ error: err.message });
   }
 });
 
-// Get all videos
+// Get Videos
 app.get("/getVideos", async (req, res) => {
   try {
     const pool = await getPool();
     const result = await pool.request().query("SELECT * FROM Videos ORDER BY UploadedAt DESC");
     res.json(result.recordset);
   } catch (err) {
+    console.error("❌ Fetch videos error:", err);
     res.status(500).json({ error: err.message });
   }
 });
 
-// Comment on a video
+// Comment
 app.post("/comment", auth(), async (req, res) => {
   const { videoId, comment } = req.body;
   try {
@@ -181,11 +184,12 @@ app.post("/comment", auth(), async (req, res) => {
       .query("INSERT INTO Comments (VideoID, UserID, CommentText) VALUES (@VideoID, @UserID, @CommentText)");
     res.json({ message: "Comment added" });
   } catch (err) {
+    console.error("❌ Comment error:", err);
     res.status(500).json({ error: err.message });
   }
 });
 
-// Rate a video
+// Rate
 app.post("/rate", auth(), async (req, res) => {
   const { videoId, rating } = req.body;
   try {
@@ -197,10 +201,11 @@ app.post("/rate", auth(), async (req, res) => {
       .query("INSERT INTO Ratings (VideoID, UserID, Rating) VALUES (@VideoID, @UserID, @Rating)");
     res.json({ message: "Rating submitted" });
   } catch (err) {
+    console.error("❌ Rating error:", err);
     res.status(500).json({ error: err.message });
   }
 });
 
-// ---------- START SERVER ---------- //
+// Start server
 const port = process.env.PORT || 8080;
 app.listen(port, () => console.log(`EchoVid API running on port ${port}`));
